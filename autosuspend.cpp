@@ -28,7 +28,7 @@ void MyHook();
 LRESULT CALLBACK LLHookMouseProc(int nCode, WPARAM wParam, LPARAM lParam);
 std::vector<HANDLE> GetProcessHandles(DWORD parentPid);
 void SuspendResume(const WCHAR* executable, bool suspend);
-void suspend_process(HANDLE processHandle);
+bool suspend_process(HANDLE processHandle);
 void resume_process(HANDLE processHandle);
 void Quit(int code);
 
@@ -54,9 +54,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		LPWSTR* parsedArgs = CommandLineToArgvW(GetCommandLineW(), &numArgs);
 		if (numArgs <= 1) {
 			MessageBox(nullptr, L"Suspend the process on mouse inactivity\n\n"
-				L"Usage:\nautosuspend.exe <target.exe> [active time seconds (default: 15)] "
-				L"[startup delay seconds (default: 5)]\n\n"
-				L"Example:\nautosuspend.exe manga_ocr.exe 15", L"autosuspend", MB_ICONINFORMATION | MB_OK);
+				L"Usage:\nautosuspend.exe <target.exe> [Unsuspend time seconds (default: 15)] "
+				L"[Startup wait seconds (default: 5)]\n\n"
+				L"Example:\nautosuspend.exe manga_ocr.exe 15 5", L"autosuspend", MB_ICONINFORMATION | MB_OK);
 			Quit(0);
 		}
 		if (numArgs >= 2) {
@@ -75,7 +75,11 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		LocalFree(parsedArgs);
 
 		// Perform application initialization:
-		if (!InitInstance(hInstance, SW_HIDE/*nCmdShow*/))
+#ifdef _DEBUG
+		if (!InitInstance(hInstance, nCmdShow))
+#else
+		if (!InitInstance(hInstance, SW_HIDE))
+#endif
 		{
 			return FALSE;
 		}
@@ -132,7 +136,7 @@ BOOL InitInstance(HINSTANCE hInstance, int nCmdShow)
 	g_hInst = hInstance; // Store instance handle in our global variable
 
 	g_hMainWnd = CreateWindowW(g_szWindowClass, g_szTitle, WS_OVERLAPPEDWINDOW,
-		CW_USEDEFAULT, 0, CW_USEDEFAULT, 0, nullptr, nullptr, hInstance, nullptr);
+		CW_USEDEFAULT, 0, 320, 240, nullptr, nullptr, hInstance, nullptr);
 
 	if (!g_hMainWnd)
 	{
@@ -153,9 +157,6 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 	case WM_TIMER:
 		KillTimer(hWnd, TMR_ACTIVE_ID);
 		g_bActivated = false;
-#ifdef _DEBUG
-		MessageBeep(MB_ICONSTOP);
-#endif
 		SuspendResume(g_sExeName.c_str(), false);
 		break;
 	case WM_COMMAND:
@@ -251,9 +252,6 @@ LRESULT CALLBACK LLHookMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 			if (!g_bActivated)
 			{
 				g_bActivated = true;
-#ifdef _DEBUG
-				MessageBeep(MB_OK);
-#endif
 				SuspendResume(g_sExeName.c_str(), true);
 			}
 			SetTimer(g_hMainWnd, TMR_ACTIVE_ID, g_iActiveInterval, nullptr);
@@ -304,6 +302,13 @@ std::vector<HANDLE> GetProcessHandles(DWORD parentPid)
 //=======================================================================
 void SuspendResume(const WCHAR* executable, bool resume)
 {
+#ifdef _DEBUG
+	if (resume)
+		MessageBeep(MB_OK);
+	else
+		MessageBeep(MB_ICONSTOP);
+#endif // _DEBUG
+
 	HANDLE hProcess = nullptr;
 	DWORD procPid = 0;
 	HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -316,6 +321,8 @@ void SuspendResume(const WCHAR* executable, bool resume)
 			{
 				procPid = pe.th32ProcessID;
 				hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pe.th32ProcessID);
+				if (hProcess == NULL)
+					throw std::exception("SuspendResume(): OpenProcess(PROCESS_ALL_ACCESS) failed");
 				break;
 			}
 		} while (Process32Next(hSnapshot, &pe));
@@ -328,10 +335,13 @@ void SuspendResume(const WCHAR* executable, bool resume)
 		if (hProcess) handles.insert(handles.begin(), hProcess);
 		for (HANDLE h : handles)
 		{
-			if (resume)
+			if (resume) {
 				resume_process(h);
-			else
-				suspend_process(h);
+			}
+			else {
+				if (!suspend_process(h))
+					throw std::exception("SuspendResume() : suspend_process() failed");
+			}
 			CloseHandle(h); // Remember to close the handles when done
 		}
 	}
@@ -345,9 +355,10 @@ void SuspendResume(const WCHAR* executable, bool resume)
 static auto nt_suspend_process = reinterpret_cast<LONG(__stdcall*)(HANDLE)>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSuspendProcess"));
 static auto nt_resume_process = reinterpret_cast<void(__stdcall*)(HANDLE)>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtResumeProcess"));
 
-void suspend_process(HANDLE processHandle)
+bool suspend_process(HANDLE processHandle)
 {
-	nt_suspend_process(processHandle);
+	LONG ret = nt_suspend_process(processHandle);
+	return (ret >= 0);
 }
 
 void resume_process(HANDLE processHandle)
