@@ -17,6 +17,7 @@ bool  g_bActivated = false;                   // target process activated flag
 std::wstring g_sExeName;                      // target process exe name
 int g_iActiveInterval = 15000;                // target app not-suspended interval
 int g_iStartupDelay = 5000;                   // how long to wait for target process to run
+std::wstring g_sExecCmd;                      // command to start target process
 
 // Forward declarations of functions included in this code module:
 ATOM             MyRegisterClass(HINSTANCE hInstance);
@@ -31,6 +32,7 @@ void SuspendResume(const WCHAR* executable, bool suspend);
 bool suspend_process(HANDLE processHandle);
 void resume_process(HANDLE processHandle);
 void Quit(int code);
+bool RunProcess(std::wstring cmd);
 
 //=======================================================================
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
@@ -41,7 +43,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	UNREFERENCED_PARAMETER(hPrevInstance);
 	UNREFERENCED_PARAMETER(lpCmdLine);
 
-	MSG msg;
+	MSG msg = { 0 };
 
 	try
 	{
@@ -55,7 +57,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		if (numArgs <= 1) {
 			MessageBox(nullptr, L"Suspend the process on mouse inactivity\n\n"
 				L"Usage:\nautosuspend.exe <target.exe> [Unsuspend time seconds (default: 15)] "
-				L"[Startup wait seconds (default: 5)]\n\n"
+				L"[Startup wait seconds (default: 5)] [exec command]\n\n"
 				L"Example:\nautosuspend.exe manga_ocr.exe 15 5", L"autosuspend", MB_ICONINFORMATION | MB_OK);
 			Quit(0);
 		}
@@ -63,14 +65,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 			g_sExeName = parsedArgs[1];
 		}
 		if (numArgs >= 3) {
-			std::wstringstream wss(parsedArgs[2]);
-			wss >> g_iActiveInterval;
+			g_iActiveInterval = std::stoi(parsedArgs[2]);
 			g_iActiveInterval = g_iActiveInterval * 1000;
 		}
 		if (numArgs >= 4) {
-			std::wstringstream wss(parsedArgs[3]);
-			wss >> g_iStartupDelay;
+			g_iStartupDelay = std::stoi(parsedArgs[3]);
 			g_iStartupDelay = g_iStartupDelay * 1000;
+		}
+		if (numArgs >= 5) {
+			g_sExecCmd = parsedArgs[4];
 		}
 		LocalFree(parsedArgs);
 
@@ -86,6 +89,10 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_AUTOSUSPEND));
 
 		// Init app
+		if (!g_sExecCmd.empty()) {
+			if (!RunProcess(g_sExecCmd))
+				throw std::exception("RunProcess() failed");
+		}
 		Sleep(g_iStartupDelay);
 		SuspendResume(g_sExeName.c_str(), false);
 		MyHook();
@@ -371,6 +378,22 @@ void Quit(int code)
 {
 	MyUnhook();
 	exit(code);
+}
+
+//=======================================================================
+bool RunProcess(std::wstring cmd)
+{
+	PROCESS_INFORMATION pi = { 0 };
+	STARTUPINFO si = { 0 };
+	si.cb = sizeof(STARTUPINFO);
+	if (CreateProcess(NULL, cmd.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+		CloseHandle(pi.hThread);
+		CloseHandle(pi.hProcess);
+	}
+	else {
+		return false;
+	}
+	return true;
 }
 
 //=======================================================================
