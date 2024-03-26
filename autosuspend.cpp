@@ -3,36 +3,55 @@
 
 #include "framework.h"
 #include "autosuspend.h"
+#include "args.hxx"
 
+#pragma comment(lib, "Wtsapi32")
+
+#define APP_TITLE "autosuspend"
 #define MAX_LOADSTRING 100
 #define TMR_ACTIVE_ID 1
+#define TMR_HOOKRESET_ID 2
+#define HOOK_MOUSEMOVE  1
+#define HOOK_MOUSECLICK 2
+#define HOOK_KEYBOARD   4
 
 // Global Variables:
 HINSTANCE g_hInst;                            // current instance
 WCHAR g_szTitle[MAX_LOADSTRING];              // title bar text
 WCHAR g_szWindowClass[MAX_LOADSTRING];        // main window class name
 HWND  g_hMainWnd = nullptr;                   // main window handle
-HHOOK g_hMouseHook = nullptr;
+HHOOK g_hMouseHook = nullptr, g_hKbdHook = nullptr;
 bool  g_bActivated = false;                   // target process activated flag
 std::wstring g_sExeName;                      // target process exe name
-int g_iActiveInterval = 15000;                // target app not-suspended interval
+int g_iActiveInterval = 20000;                // target app not-suspended interval
 int g_iStartupDelay = 5000;                   // how long to wait for target process to run
 std::wstring g_sExecCmd;                      // command to start target process
+UINT g_uiHookParam = 0;                       // what input to track
+HWINEVENTHOOK g_hWinEventHook = nullptr;
 
 // Forward declarations of functions included in this code module:
-ATOM             MyRegisterClass(HINSTANCE hInstance);
-BOOL             InitInstance(HINSTANCE, int);
+ATOM MyRegisterClass(HINSTANCE hInstance);
+BOOL InitInstance(HINSTANCE, int);
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 INT_PTR CALLBACK About(HWND, UINT, WPARAM, LPARAM);
 void MyUnhook();
 void MyHook();
 LRESULT CALLBACK LLHookMouseProc(int nCode, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK LLHookKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
 std::vector<HANDLE> GetProcessHandles(DWORD parentPid);
 void SuspendResume(const WCHAR* executable, bool suspend);
 bool suspend_process(HANDLE processHandle);
 void resume_process(HANDLE processHandle);
 void Quit(int code);
 bool RunProcess(std::wstring cmd);
+void get_command_line_args(int* argc, char*** argv);
+std::wstring utf8_utf16(std::string str);
+void ShowMessage(std::wstring wmsg, UINT type, HWND hwnd = nullptr);
+void ShowMessage(std::string msg, UINT type, HWND hwnd = nullptr);
+void Unsuspend();
+void CALLBACK winEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject,
+	LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime);
+void HookReset();
 
 //=======================================================================
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
@@ -52,30 +71,60 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		LoadStringW(hInstance, IDC_AUTOSUSPEND, g_szWindowClass, MAX_LOADSTRING);
 		MyRegisterClass(hInstance);
 
-		int numArgs = 0;
-		LPWSTR* parsedArgs = CommandLineToArgvW(GetCommandLineW(), &numArgs);
-		if (numArgs <= 1) {
-			MessageBox(nullptr, L"Suspend the process on mouse inactivity\n\n"
-				L"Usage:\nautosuspend.exe <target.exe> [Unsuspend time seconds (default: 15)] "
-				L"[Startup wait seconds (default: 5)] [exec command]\n\n"
-				L"Example:\nautosuspend.exe manga_ocr.exe 15 5", L"autosuspend", MB_ICONINFORMATION | MB_OK);
-			Quit(0);
+		// convert args to UTF8 for use in args::ArgumentParser
+		int argc = 0;
+		char** argv = nullptr;
+		get_command_line_args(&argc, &argv);
+
+		args::ArgumentParser parser("Suspend the process on keyboard/mouse inactivity.",
+			"Example:\nautosuspend.exe manga_ocr.exe 20 5 /mc");
+		parser.LongPrefix("/");
+		args::HelpFlag help(parser, "help", "Display this help menu", { "help" });
+		args::ValueFlag<std::string> arg_run(parser, "cmd", "Execute command", { "run" });
+		args::Group group1(parser, "The target process:", args::Group::Validators::All);
+		args::Positional<std::string> arg_exeName(group1, "exe", "Tadget executable name");
+		args::Positional<int> arg_interval(group1, "interval", "Unsuspend time (sec)");
+		args::Positional<int> arg_delay(group1, "delay", "Startup wait for target process (sec)");
+		args::Group group2(parser, "Unsuspend the process on:", args::Group::Validators::AtLeastOne);
+		args::Flag arg_mouseMove(group2, "mm", "Mouse move", { "mm" });
+		args::Flag arg_mouseClick(group2, "mc", "Mouse click", { "mc" });
+		args::Flag arg_keyb(group2, "kb", "Key press", { "kb" });
+		try
+		{
+			parser.ParseCLI(argc, argv);
 		}
-		if (numArgs >= 2) {
-			g_sExeName = parsedArgs[1];
+		catch (args::Help)
+		{
+			std::stringstream ss;
+			ss << parser;
+			ShowMessage(ss.str(), MB_ICONINFORMATION | MB_OK);
+			return 0;
 		}
-		if (numArgs >= 3) {
-			g_iActiveInterval = std::stoi(parsedArgs[2]);
-			g_iActiveInterval = g_iActiveInterval * 1000;
+		catch (args::ParseError e)
+		{
+			std::stringstream ss;
+			ss << e.what() << "\n\n";
+			ss << parser;
+			ShowMessage(ss.str(), MB_ICONINFORMATION | MB_OK);
+			return 1;
 		}
-		if (numArgs >= 4) {
-			g_iStartupDelay = std::stoi(parsedArgs[3]);
-			g_iStartupDelay = g_iStartupDelay * 1000;
+		catch (args::ValidationError e)
+		{
+			std::stringstream ss;
+			ss << e.what() << "\n\n";
+			ss << parser;
+			ShowMessage(ss.str(), MB_ICONINFORMATION | MB_OK);
+			return 1;
 		}
-		if (numArgs >= 5) {
-			g_sExecCmd = parsedArgs[4];
-		}
-		LocalFree(parsedArgs);
+		if (arg_run) g_sExecCmd = utf8_utf16(args::get(arg_run));
+		if (arg_exeName) g_sExeName = utf8_utf16(args::get(arg_exeName));
+		if (arg_interval) g_iActiveInterval = args::get(arg_interval) * 1000;
+		if (arg_delay) g_iStartupDelay = args::get(arg_delay) * 1000;
+		if (arg_mouseMove) g_uiHookParam |= HOOK_MOUSEMOVE;
+		if (arg_mouseClick) g_uiHookParam |= HOOK_MOUSECLICK;
+		if (arg_keyb) g_uiHookParam |= HOOK_KEYBOARD;
+
+		free(argv);
 
 		// Perform application initialization:
 #ifdef _DEBUG
@@ -88,13 +137,26 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		}
 		HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_AUTOSUSPEND));
 
-		// Init app
+		// INIT APP
+		SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS); // to less break under heavy CPU load
+
 		if (!g_sExecCmd.empty()) {
 			if (!RunProcess(g_sExecCmd))
 				throw std::exception("RunProcess() failed");
 		}
+
 		Sleep(g_iStartupDelay);
 		SuspendResume(g_sExeName.c_str(), false);
+
+		// register system notifications to repair hooks
+		if (FALSE == WTSRegisterSessionNotification(g_hMainWnd, NOTIFY_FOR_THIS_SESSION))
+			throw std::exception("WTSRegisterSessionNotification() failed");
+		g_hWinEventHook = SetWinEventHook(EVENT_SYSTEM_DESKTOPSWITCH,
+			EVENT_SYSTEM_DESKTOPSWITCH, NULL, winEventProc, 0, 0,
+			WINEVENT_OUTOFCONTEXT /* | WINEVENT_SKIPOWNPROCESS */);
+		if (!g_hWinEventHook)
+			throw std::exception("SetWinEventHook() failed");
+
 		MyHook();
 
 		// Main message loop:
@@ -109,12 +171,25 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 	}
 	catch (std::exception& e)
 	{
-		MessageBoxA(nullptr, e.what(), "autosuspend", MB_OK | MB_ICONERROR);
+		ShowMessage(e.what(), MB_OK | MB_ICONERROR);
 	}
 
 	Quit(0);
 
 	return (int)msg.wParam;
+}
+
+//=======================================================================
+void CALLBACK winEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject,
+	LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime)
+{
+	HookReset();
+}
+
+//=======================================================================
+void HookReset()
+{
+	SetTimer(g_hMainWnd, TMR_HOOKRESET_ID, 500, nullptr);
 }
 
 //=======================================================================
@@ -161,10 +236,24 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	switch (message)
 	{
+	case WM_SETTINGCHANGE:
+	case WM_DISPLAYCHANGE:
+	case WM_DEVICECHANGE:
+	case WM_WTSSESSION_CHANGE:
+		HookReset();
+		break;
 	case WM_TIMER:
-		KillTimer(hWnd, TMR_ACTIVE_ID);
-		g_bActivated = false;
-		SuspendResume(g_sExeName.c_str(), false);
+		KillTimer(hWnd, wParam); // one time timers
+		switch (wParam)
+		{
+		case TMR_ACTIVE_ID:
+			g_bActivated = false;
+			SuspendResume(g_sExeName.c_str(), false);
+			break;
+		case TMR_HOOKRESET_ID:
+			MyHook();
+			break;
+		}
 		break;
 	case WM_COMMAND:
 	{
@@ -224,25 +313,47 @@ INT_PTR CALLBACK About(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam)
 void MyUnhook()
 {
 	// release hooks
-	if (g_hMouseHook)
-	{
+	if (g_hMouseHook) {
 		UnhookWindowsHookEx(g_hMouseHook);
 		g_hMouseHook = nullptr;
+	}
+	if (g_hKbdHook) {
+		UnhookWindowsHookEx(g_hKbdHook);
+		g_hKbdHook = nullptr;
 	}
 }
 
 //=======================================================================
 void MyHook()
 {
-	MyUnhook();
+#ifdef _DEBUG
+	Beep(500, 200);
+#endif // _DEBUG
 
 	// set up hooks
-	g_hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, (HOOKPROC)LLHookMouseProc,
-		GetModuleHandle(nullptr), NULL);
-	if (!g_hMouseHook)
-	{
-		throw std::exception("SetWindowsHookEx(WH_MOUSE_LL) failed");
+	MyUnhook();
+	if ((g_uiHookParam & HOOK_MOUSEMOVE) == HOOK_MOUSEMOVE ||
+		(g_uiHookParam & HOOK_MOUSECLICK) == HOOK_MOUSECLICK) {
+		g_hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, (HOOKPROC)LLHookMouseProc,
+			GetModuleHandle(nullptr), NULL);
+		if (!g_hMouseHook) throw std::exception("SetWindowsHookEx(WH_MOUSE_LL) failed");
 	}
+	if ((g_uiHookParam & HOOK_KEYBOARD) == HOOK_KEYBOARD) {
+		g_hKbdHook = SetWindowsHookEx(WH_KEYBOARD_LL, (HOOKPROC)LLHookKeyboardProc,
+			GetModuleHandle(NULL), NULL);
+		if (!g_hKbdHook) throw std::exception("SetWindowsHookEx(WH_KEYBOARD_LL) failed");
+	}
+}
+
+//=======================================================================
+void Unsuspend()
+{
+	if (!g_bActivated)
+	{
+		g_bActivated = true;
+		SuspendResume(g_sExeName.c_str(), true);
+	}
+	SetTimer(g_hMainWnd, TMR_ACTIVE_ID, g_iActiveInterval, nullptr);
 }
 
 //=======================================================================
@@ -252,20 +363,33 @@ LRESULT CALLBACK LLHookMouseProc(int nCode, WPARAM wParam, LPARAM lParam)
 	{
 		switch (wParam)
 		{
+		case WM_MOUSEMOVE:
+		case WM_MOUSEWHEEL:
+			if ((g_uiHookParam & HOOK_MOUSEMOVE) == HOOK_MOUSEMOVE) {
+				Unsuspend();
+			}
+			break;
 		case WM_LBUTTONDOWN:
 		case WM_LBUTTONUP:
 		case WM_RBUTTONDOWN:
 		case WM_RBUTTONUP:
-			if (!g_bActivated)
-			{
-				g_bActivated = true;
-				SuspendResume(g_sExeName.c_str(), true);
+			if ((g_uiHookParam & HOOK_MOUSECLICK) == HOOK_MOUSECLICK) {
+				Unsuspend();
 			}
-			SetTimer(g_hMainWnd, TMR_ACTIVE_ID, g_iActiveInterval, nullptr);
 			break;
 		}
 	}
 	return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
+}
+
+//=======================================================================
+LRESULT CALLBACK LLHookKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+	if (nCode == HC_ACTION) // allowed to process message now
+	{
+		Unsuspend();
+	}
+	return CallNextHookEx(g_hKbdHook, nCode, wParam, lParam);
 }
 
 //=======================================================================
@@ -353,7 +477,7 @@ void SuspendResume(const WCHAR* executable, bool resume)
 		}
 	}
 	else {
-		//MessageBox(nullptr, L"Process not found", L"autosuspend", MB_OK);
+		// Process not found
 		Quit(0);
 	}
 }
@@ -376,6 +500,10 @@ void resume_process(HANDLE processHandle)
 //=======================================================================
 void Quit(int code)
 {
+	WTSUnRegisterSessionNotification(g_hMainWnd);
+	if (g_hWinEventHook) {
+		UnhookWinEvent(g_hWinEventHook);
+	}
 	MyUnhook();
 	exit(code);
 }
@@ -394,6 +522,56 @@ bool RunProcess(std::wstring cmd)
 		return false;
 	}
 	return true;
+}
+
+//=======================================================================
+void get_command_line_args(int* argc, char*** argv)
+{
+	// Get the command line arguments as wchar_t strings
+	wchar_t** wargv = CommandLineToArgvW(GetCommandLineW(), argc);
+	if (!wargv) { *argc = 0; *argv = NULL; return; }
+
+	// Count the number of bytes necessary to store the UTF-8 versions of those strings
+	int n = 0;
+	for (int i = 0; i < *argc; i++)
+		n += WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+
+	// Allocate the argv[] array + all the UTF-8 strings
+	*argv = (char**)malloc((*argc + 1) * sizeof(char*) + n);
+	if (!*argv) { *argc = 0; return; }
+
+	// Convert all wargv[] --> argv[]
+	char* arg = (char*)&((*argv)[*argc + 1]);
+	for (int i = 0; i < *argc; i++)
+	{
+		(*argv)[i] = arg;
+		arg += WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, arg, n, NULL, NULL);
+	}
+	(*argv)[*argc] = NULL;
+	LocalFree(wargv);
+}
+
+//=======================================================================
+std::wstring utf8_utf16(std::string str)
+{
+	std::wstring wide;
+	int result = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, NULL, 0);
+	if (result <= 0) throw std::exception("utf8_utf16() failed");
+
+	wide.resize((size_t)result + 10);
+	result = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, &wide[0], (int)wide.size());
+	if (result <= 0) throw std::exception("utf8_utf16() failed");
+	return wide;
+}
+
+//=======================================================================
+void ShowMessage(std::wstring wmsg, UINT type, HWND hwnd)
+{
+	MessageBoxW(hwnd, wmsg.c_str(), _T(APP_TITLE), type);
+}
+void ShowMessage(std::string msg, UINT type, HWND hwnd)
+{
+	ShowMessage(utf8_utf16(msg), type, hwnd);
 }
 
 //=======================================================================

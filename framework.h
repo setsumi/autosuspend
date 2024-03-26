@@ -20,3 +20,4 @@
 #include <sstream>
 #include <tlhelp32.h>
 #include <shellapi.h>
+#include <wtsapi32.h>
