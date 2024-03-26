@@ -82,7 +82,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		args::HelpFlag help(parser, "help", "Display this help menu", { "help" });
 		args::ValueFlag<std::string> arg_run(parser, "cmd", "Execute command", { "run" });
 		args::Group group1(parser, "The target process:", args::Group::Validators::All);
-		args::Positional<std::string> arg_exeName(group1, "exe", "Tadget executable name");
+		args::Positional<std::string> arg_exeName(group1, "exe", "Target executable name");
 		args::Positional<int> arg_interval(group1, "interval", "Unsuspend time (sec)");
 		args::Positional<int> arg_delay(group1, "delay", "Startup wait for target process (sec)");
 		args::Group group2(parser, "Unsuspend the process on:", args::Group::Validators::AtLeastOne);
