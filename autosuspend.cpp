@@ -7,13 +7,13 @@
 
 #pragma comment(lib, "Wtsapi32")
 
-#define APP_TITLE "autosuspend"
 #define MAX_LOADSTRING 100
 #define TMR_ACTIVE_ID 1
 #define TMR_HOOKRESET_ID 2
 #define HOOK_MOUSEMOVE  1
 #define HOOK_MOUSECLICK 2
 #define HOOK_KEYBOARD   4
+const UINT WM_CUSTOM_DROPORPHANS = WM_USER + 1;
 
 // Global Variables:
 HINSTANCE g_hInst;                            // current instance
@@ -39,7 +39,7 @@ void MyHook();
 LRESULT CALLBACK LLHookMouseProc(int nCode, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK LLHookKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
 std::vector<HANDLE> GetProcessHandles(DWORD parentPid);
-void SuspendResume(const WCHAR* executable, bool suspend);
+void SuspendResume(const WCHAR* executable, bool suspend, bool passive = false);
 bool suspend_process(HANDLE processHandle);
 void resume_process(HANDLE processHandle);
 void Quit(int code);
@@ -52,6 +52,7 @@ void Unsuspend();
 void CALLBACK winEventProc(HWINEVENTHOOK hook, DWORD event, HWND hwnd, LONG idObject,
 	LONG idChild, DWORD dwEventThread, DWORD dwmsEventTime);
 void HookReset();
+BOOL CALLBACK EnumWindowsProcDropOrphans(HWND hwnd, LPARAM lpParam);
 
 //=======================================================================
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
@@ -64,6 +65,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
 	MSG msg = { 0 };
 
+	SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS); // to less break under heavy CPU load
 	try
 	{
 		// Initialize global strings
@@ -126,6 +128,9 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 
 		free(argv);
 
+		// drop orphaned autosuspend.exe processes to avoid duplicates
+		EnumWindows(EnumWindowsProcDropOrphans, NULL);
+
 		// Perform application initialization:
 #ifdef _DEBUG
 		if (!InitInstance(hInstance, nCmdShow))
@@ -138,8 +143,6 @@ int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
 		HACCEL hAccelTable = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_AUTOSUSPEND));
 
 		// INIT APP
-		SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS); // to less break under heavy CPU load
-
 		if (!g_sExecCmd.empty()) {
 			if (!RunProcess(g_sExecCmd))
 				throw std::exception("RunProcess() failed");
@@ -236,6 +239,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 {
 	switch (message)
 	{
+	case WM_CUSTOM_DROPORPHANS:
+		SuspendResume(g_sExeName.c_str(), true, true);
+		break;
 	case WM_SETTINGCHANGE:
 	case WM_DISPLAYCHANGE:
 	case WM_DEVICECHANGE:
@@ -431,7 +437,7 @@ std::vector<HANDLE> GetProcessHandles(DWORD parentPid)
 }
 
 //=======================================================================
-void SuspendResume(const WCHAR* executable, bool resume)
+void SuspendResume(const WCHAR* executable, bool resume, bool passive)
 {
 #ifdef _DEBUG
 	if (resume)
@@ -462,18 +468,24 @@ void SuspendResume(const WCHAR* executable, bool resume)
 
 	if (procPid != 0)
 	{
-		std::vector<HANDLE> handles = GetProcessHandles(procPid);
-		if (hProcess) handles.insert(handles.begin(), hProcess);
-		for (HANDLE h : handles)
+		if (!passive)
 		{
-			if (resume) {
-				resume_process(h);
+			std::vector<HANDLE> handles = GetProcessHandles(procPid);
+			if (hProcess) handles.insert(handles.begin(), hProcess);
+			for (HANDLE h : handles)
+			{
+				if (resume) {
+					resume_process(h);
+				}
+				else {
+					if (!suspend_process(h))
+						throw std::exception("SuspendResume() : suspend_process() failed");
+				}
+				CloseHandle(h); // close the handles when done
 			}
-			else {
-				if (!suspend_process(h))
-					throw std::exception("SuspendResume() : suspend_process() failed");
-			}
-			CloseHandle(h); // Remember to close the handles when done
+		}
+		else {
+			if (hProcess) CloseHandle(hProcess);
 		}
 	}
 	else {
@@ -567,11 +579,28 @@ std::wstring utf8_utf16(std::string str)
 //=======================================================================
 void ShowMessage(std::wstring wmsg, UINT type, HWND hwnd)
 {
-	MessageBoxW(hwnd, wmsg.c_str(), _T(APP_TITLE), type);
+	MessageBoxW(hwnd, wmsg.c_str(), g_szTitle, type);
 }
 void ShowMessage(std::string msg, UINT type, HWND hwnd)
 {
 	ShowMessage(utf8_utf16(msg), type, hwnd);
+}
+
+//=======================================================================
+BOOL CALLBACK EnumWindowsProcDropOrphans(HWND hwnd, LPARAM lpParam)
+{
+	DWORD processId = 0;
+	DWORD windowThreadId = GetWindowThreadProcessId(hwnd, &processId);
+	if (GetCurrentThreadId() != windowThreadId) {
+		wchar_t windowClass[256];
+		if (GetClassName(hwnd, windowClass, sizeof(windowClass) / sizeof(windowClass[0])) <= 0)
+			throw std::exception("EnumWindowsProcDropOrphans() : GetClassName() failed");
+		if (wcscmp(windowClass, g_szWindowClass) == 0) {
+			// Send the user message to the window
+			PostMessage(hwnd, WM_CUSTOM_DROPORPHANS, 0, 0);
+		}
+	}
+	return TRUE;
 }
 
 //=======================================================================
